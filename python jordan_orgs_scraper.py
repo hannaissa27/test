@@ -8,180 +8,195 @@ Requirements:
 
 Usage:
     python jordan_orgs_scraper.py
-
-The script scrapes every organization page (IDs 1–1500),
-extracts name, governorate, category, phone, email, website,
-and address, then saves everything to an Excel file.
 """
 
 import time
 import re
 import requests
 import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from bs4 import BeautifulSoup
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-BASE_URL = "http://www.civilsociety-jo.net/en/organization/{id}/"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+BASE = "http://www.civilsociety-jo.net"
+
+CATEGORY_URLS = [
+    "/en/organizations/1/employers-unions",
+    "/en/organizations/2/employers-associations",
+    "/en/organizations/3/chambers-of-commerce",
+    "/en/organizations/4/chambers-of-industry",
+    "/en/organizations/5/professional-associations",
+    "/en/organizations/6/professional-societies",
+    "/en/organizations/7/women-organizations",
+    "/en/organizations/8/health-care-organizations",
+    "/en/organizations/9/youth--sport-clubs",
+    "/en/organizations/10/cultural--scientific-organizations",
+    "/en/organizations/11/persons-with-disabilities-organizations",
+    "/en/organizations/12/environmental-organizations",
+    "/en/organizations/13/child--orphas-care-organizations",
+    "/en/organizations/14/graduates-of-universities-and-institutes",
+    "/en/organizations/15/charities",
+    "/en/organizations/16/human-rights-organizations",
+    "/en/organizations/17/trade-unions",
+    "/en/organizations/18/special-commissions",
+    "/en/organizations/19/research-centers",
+    "/en/organizations/20/foreign-organizations",
+]
+
+CATEGORY_NAMES = {
+    "1": "Employers Unions", "2": "Employers Associations",
+    "3": "Chambers of Commerce", "4": "Chambers of Industry",
+    "5": "Professional Associations", "6": "Professional Societies",
+    "7": "Women Organizations", "8": "Health Care Organizations",
+    "9": "Youth & Sport Clubs", "10": "Cultural & Scientific Organizations",
+    "11": "Persons with Disabilities Organizations", "12": "Environmental Organizations",
+    "13": "Child & Orphans Care Organizations", "14": "Graduates of Universities and Institutes",
+    "15": "Charities", "16": "Human Rights Organizations",
+    "17": "Trade Unions", "18": "Special Commissions",
+    "19": "Research Centers", "20": "Foreign Organizations",
 }
 
-# IDs observed go up to ~25000; the script skips 404s automatically
-ID_RANGE = range(1, 25001)
-
-# Delay between requests (seconds) — be polite to the server
-REQUEST_DELAY = 0.8
+REQUEST_DELAY = 0.6
 
 
-def scrape_org(org_id: int, session: requests.Session) -> dict | None:
-    url = BASE_URL.format(id=org_id)
-    try:
-        resp = session.get(url, timeout=15, verify=False)
-    except requests.RequestException:
+def get_session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    })
+    return s
+
+
+def fetch(session, url, retries=3):
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=20, verify=False)
+            if r.status_code == 200:
+                return r.text
+        except requests.RequestException as e:
+            if attempt == retries - 1:
+                print(f"    Failed: {url} — {e}")
+            time.sleep(2)
+    return None
+
+
+def collect_org_urls(session):
+    org_urls = {}
+    for cat_path in CATEGORY_URLS:
+        cat_id = cat_path.split("/")[3]
+        cat_name = CATEGORY_NAMES.get(cat_id, "Unknown")
+        url = BASE + cat_path
+        print(f"  Collecting: {cat_name} ...", end=" ", flush=True)
+        html = fetch(session, url)
+        if not html:
+            print("FAILED")
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        links = soup.find_all("a", href=re.compile(r"/en/organization/\d+/"))
+        found = 0
+        for a in links:
+            href = a["href"]
+            if href not in org_urls:
+                org_urls[href] = cat_name
+                found += 1
+        print(f"{found} orgs found")
+        time.sleep(REQUEST_DELAY)
+    print(f"\n  Total unique org URLs collected: {len(org_urls)}\n")
+    return org_urls
+
+
+def scrape_org(session, url, category):
+    html = fetch(session, url)
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+    h1 = soup.find("h1")
+    if not h1:
+        return None
+    name = h1.get_text(strip=True)
+    if not name:
         return None
 
-    if resp.status_code != 200:
-        return None
+    full_text = soup.get_text("\n", strip=True)
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # If the page has no org title it's a redirect / empty page
-    title_tag = soup.find("h1")
-    if not title_tag:
-        return None
-    name = title_tag.get_text(strip=True)
-    if not name or name.lower() in ("home", ""):
-        return None
-
-    # ── Breadcrumb gives us category ──────────────────────────────────────────
-    breadcrumbs = soup.select("ol.breadcrumb li, .breadcrumb li, nav li")
-    category = ""
-    if len(breadcrumbs) >= 2:
-        # last breadcrumb before the org name is the category
-        category = breadcrumbs[-2].get_text(strip=True)
-
-    # ── Right-hand contact card ────────────────────────────────────────────────
-    # The contact block is a <div> that contains the org name as a link,
-    # then plain text lines with phone / fax / address, and <a> tags for
-    # email and website.
-    contact_block = soup.find("div", class_=re.compile(r"contact|info|card", re.I))
-    if not contact_block:
-        # fall back: look for the section that immediately follows the h1
-        contact_block = soup.find("section") or soup.find("article") or soup.body
-
-    full_text = contact_block.get_text("\n", strip=True) if contact_block else ""
-
-    # Website
     website = ""
-    for a in (contact_block or soup).find_all("a", href=True):
+    for a in soup.find_all("a", href=True):
         href = a["href"]
-        if href.startswith("http") and "civilsociety-jo.net" not in href:
+        if (href.startswith("http") and
+                "civilsociety-jo.net" not in href and
+                "phenixcenter" not in href and
+                "facebook.com" not in href):
             website = href
             break
 
-    # Email
     email = ""
-    mailto = (contact_block or soup).find("a", href=re.compile(r"^mailto:", re.I))
+    mailto = soup.find("a", href=re.compile(r"^mailto:", re.I))
     if mailto:
         email = mailto["href"].replace("mailto:", "").strip()
     else:
-        # Try to find raw email in text
-        match = re.search(r"[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}", full_text)
-        if match:
-            email = match.group()
+        m = re.search(r"[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}", full_text)
+        if m:
+            email = m.group()
 
-    # Phone — lines that look like Jordanian numbers: 06-…, 079…, +962…, 07…
-    phone_pattern = re.compile(
-        r"(?:\+962[\s\-]?|0)(?:6|7\d)[\s\-]?\d{3,4}[\s\-]?\d{4}"
-    )
-    phones = list(dict.fromkeys(phone_pattern.findall(full_text)))  # unique, ordered
+    phone_pat = re.compile(r"(?:\+962[\s\-]?|0)(?:6|7\d)[\s\-]?\d{3,4}[\s\-]?\d{4}")
+    phones = list(dict.fromkeys(phone_pat.findall(full_text)))
     phone = " / ".join(phones[:3]) if phones else ""
 
-    # Fax — same pattern but preceded by "fax"
     fax = ""
-    fax_match = re.search(
-        r"[Ff]ax[:\s]*(" + phone_pattern.pattern + r")", full_text
-    )
-    if fax_match:
-        fax = fax_match.group(1)
+    fax_m = re.search(r"[Ff]ax[:\s]*(" + phone_pat.pattern + r")", full_text)
+    if fax_m:
+        fax = fax_m.group(1)
 
-    # Governorate — shown as a small badge/link near the top
     governorate = ""
-    gov_link = (contact_block or soup).find(
-        "a",
-        href=re.compile(r"governorate|amman|irbid|zarqa|mafraq|ajloun|jerash|"
-                        r"madaba|balqa|karak|tafileh|maan|aqaba", re.I)
-    )
-    if gov_link:
-        governorate = gov_link.get_text(strip=True)
-    else:
-        # Try the page text: look for a governorate keyword near the title
-        gov_pattern = re.compile(
-            r"\b(Amman|Irbid|Zarqa|Mafraq|Ajloun|Jerash|Madaba|Balqa|"
-            r"Karak|Tafileh|Ma.an|Aqaba)\b", re.I
-        )
-        gm = gov_pattern.search(full_text)
-        if gm:
-            governorate = gm.group(1).title()
+    gov_pat = re.compile(
+        r"\b(Amman|Irbid|Zarqa|Mafraq|Ajloun|Jerash|Madaba|Balqa|Karak|Tafileh|Ma.?an|Aqaba)\b", re.I)
+    gm = gov_pat.search(full_text[:500])
+    if gm:
+        governorate = gm.group(1).title()
 
-    # Address — everything after the last phone number until end of block
     address = ""
-    addr_match = re.search(
-        r"(?:Jordan|P\.?O\.?\s*Box|Street|St\.|Amman|Irbid)[^\n]{5,80}", full_text
-    )
-    if addr_match:
-        address = addr_match.group().strip()
+    addr_m = re.search(r"(?:Jordan|P\.?O\.?\s*Box|Street|St\.|Amman|Irbid)[^\n]{5,80}", full_text)
+    if addr_m:
+        address = addr_m.group().strip()
+
+    facebook = ""
+    fb = soup.find("a", href=re.compile(r"facebook\.com", re.I))
+    if fb:
+        facebook = fb["href"]
 
     return {
-        "ID": org_id,
-        "Name": name,
-        "Category": category,
-        "Governorate": governorate,
-        "Phone": phone,
-        "Fax": fax,
-        "Email": email,
-        "Website": website,
-        "Address": address,
-        "Source URL": url,
+        "Name": name, "Category": category, "Governorate": governorate,
+        "Phone": phone, "Fax": fax, "Email": email, "Website": website,
+        "Facebook": facebook, "Address": address, "Source URL": url,
     }
 
 
-def build_excel(records: list[dict], output_path: str) -> None:
+def build_excel(records, output_path):
     wb = Workbook()
     ws = wb.active
     ws.title = "Organizations"
 
-    # ── Styles ─────────────────────────────────────────────────────────────────
     header_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
-    header_fill = PatternFill("solid", start_color="1F4E79")  # dark blue
+    header_fill = PatternFill("solid", start_color="1F4E79")
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left_wrap = Alignment(horizontal="left", vertical="center", wrap_text=True)
     thin = Side(style="thin", color="CCCCCC")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    alt_fill = PatternFill("solid", start_color="EBF3FB")  # light blue stripe
+    alt_fill = PatternFill("solid", start_color="EBF3FB")
 
     columns = [
-        ("No.",          5),
-        ("Organization Name", 40),
-        ("Category",     25),
-        ("Governorate",  14),
-        ("Phone",        22),
-        ("Fax",          18),
-        ("Email",        32),
-        ("Website",      35),
-        ("Address",      40),
-        ("Source URL",   45),
+        ("No.", 5), ("Organization Name", 45), ("Category", 30),
+        ("Governorate", 14), ("Phone", 24), ("Fax", 18), ("Email", 32),
+        ("Website", 35), ("Facebook", 35), ("Address", 40), ("Source URL", 50),
     ]
 
-    # Header row
     ws.row_dimensions[1].height = 30
     for col_idx, (header, width) in enumerate(columns, start=1):
         cell = ws.cell(row=1, column=col_idx, value=header)
@@ -191,14 +206,12 @@ def build_excel(records: list[dict], output_path: str) -> None:
         cell.border = border
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
-    # Freeze header
     ws.freeze_panes = "A2"
-
-    # Data rows
-    fields = ["ID", "Name", "Category", "Governorate",
-              "Phone", "Fax", "Email", "Website", "Address", "Source URL"]
+    fields = ["_row", "Name", "Category", "Governorate", "Phone", "Fax",
+              "Email", "Website", "Facebook", "Address", "Source URL"]
 
     for row_idx, rec in enumerate(records, start=2):
+        rec["_row"] = row_idx - 1
         fill = alt_fill if row_idx % 2 == 0 else PatternFill()
         ws.row_dimensions[row_idx].height = 18
         for col_idx, field in enumerate(fields, start=1):
@@ -210,66 +223,84 @@ def build_excel(records: list[dict], output_path: str) -> None:
             if fill.fill_type:
                 cell.fill = fill
 
-    # Auto-filter
     ws.auto_filter.ref = ws.dimensions
 
-    # Summary sheet
     ws2 = wb.create_sheet("Summary")
-    ws2["A1"] = "Total Organizations Scraped"
+    ws2["A1"] = "Total Organizations"
     ws2["B1"] = len(records)
-    ws2["A1"].font = Font(bold=True, name="Arial")
-
-    gov_counts: dict[str, int] = {}
-    for r in records:
-        g = r.get("Governorate") or "Unknown"
-        gov_counts[g] = gov_counts.get(g, 0) + 1
+    ws2["A1"].font = Font(bold=True, name="Arial", size=12)
+    ws2["B1"].font = Font(bold=True, name="Arial", size=12)
 
     ws2["A3"] = "Governorate"
     ws2["B3"] = "Count"
     ws2["A3"].font = Font(bold=True, name="Arial")
     ws2["B3"].font = Font(bold=True, name="Arial")
+    gov_counts = {}
+    for r in records:
+        g = r.get("Governorate") or "Unknown"
+        gov_counts[g] = gov_counts.get(g, 0) + 1
     for i, (gov, cnt) in enumerate(sorted(gov_counts.items()), start=4):
         ws2.cell(row=i, column=1, value=gov).font = Font(name="Arial", size=10)
         ws2.cell(row=i, column=2, value=cnt).font = Font(name="Arial", size=10)
-    ws2.column_dimensions["A"].width = 20
+
+    row_offset = len(gov_counts) + 6
+    ws2.cell(row=row_offset, column=1, value="Category").font = Font(bold=True, name="Arial")
+    ws2.cell(row=row_offset, column=2, value="Count").font = Font(bold=True, name="Arial")
+    cat_counts = {}
+    for r in records:
+        c = r.get("Category") or "Unknown"
+        cat_counts[c] = cat_counts.get(c, 0) + 1
+    for i, (cat, cnt) in enumerate(sorted(cat_counts.items()), start=row_offset + 1):
+        ws2.cell(row=i, column=1, value=cat).font = Font(name="Arial", size=10)
+        ws2.cell(row=i, column=2, value=cnt).font = Font(name="Arial", size=10)
+
+    ws2.column_dimensions["A"].width = 40
     ws2.column_dimensions["B"].width = 10
 
     wb.save(output_path)
-    print(f"\n✅  Saved {len(records)} organizations → {output_path}")
+    print(f"\n  Saved {len(records)} organizations -> {output_path}")
 
 
 def main():
     output_file = "jordan_organizations.xlsx"
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    session = get_session()
 
+    print("=" * 60)
+    print("  Jordan Civil Society Organizations Scraper")
+    print("  Source: civilsociety-jo.net")
+    print("=" * 60)
+
+    print("\n[Step 1] Collecting organization URLs from category pages...\n")
+    org_urls = collect_org_urls(session)
+
+    if not org_urls:
+        print("No URLs collected. Check your internet connection.")
+        return
+
+    print(f"[Step 2] Scraping {len(org_urls)} organization pages...\n")
     records = []
-    consecutive_misses = 0
+    total = len(org_urls)
 
-    print("Starting scrape of civilsociety-jo.net …")
-    print(f"Checking IDs 1 – {max(ID_RANGE)}  (delay: {REQUEST_DELAY}s per request)\n")
-
-    for org_id in ID_RANGE:
-        result = scrape_org(org_id, session)
+    for i, (url, category) in enumerate(org_urls.items(), start=1):
+        full_url = BASE + url if url.startswith("/") else url
+        result = scrape_org(session, full_url, category)
         if result:
             records.append(result)
-            consecutive_misses = 0
             gov = result["Governorate"] or "?"
-            print(f"  [{org_id:4d}] ✓  {result['Name'][:55]:<55}  [{gov}]")
+            print(f"  [{i:4d}/{total}] OK  {result['Name'][:50]:<50}  [{gov}]")
         else:
-            consecutive_misses += 1
-            print(f"  [{org_id:4d}] –  (no data)")
-            # If 100 IDs in a row return nothing, we're past the end
-            if consecutive_misses >= 2000:
-                print(f"\nNo data found for 2000 consecutive IDs. Stopping early.")
-                break
+            print(f"  [{i:4d}/{total}] --  (failed: {url[:60]})")
+
+        if i % 100 == 0:
+            build_excel(records, output_file)
+            print(f"\n  Progress saved ({len(records)} orgs so far)\n")
 
         time.sleep(REQUEST_DELAY)
 
     if records:
         build_excel(records, output_file)
     else:
-        print("No records found. Check your internet connection or the site URL.")
+        print("No records scraped.")
 
 
 if __name__ == "__main__":
