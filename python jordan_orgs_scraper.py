@@ -17,6 +17,8 @@ and address, then saves everything to an Excel file.
 import time
 import re
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from bs4 import BeautifulSoup
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -31,8 +33,8 @@ HEADERS = {
     )
 }
 
-# IDs observed go up to ~1500; the script skips 404s automatically
-ID_RANGE = range(1, 1501)
+# IDs observed go up to ~25000; the script skips 404s automatically
+ID_RANGE = range(1, 25001)
 
 # Delay between requests (seconds) — be polite to the server
 REQUEST_DELAY = 0.8
@@ -41,7 +43,7 @@ REQUEST_DELAY = 0.8
 def scrape_org(org_id: int, session: requests.Session) -> dict | None:
     url = BASE_URL.format(id=org_id)
     try:
-        resp = session.get(url, timeout=15)
+        resp = session.get(url, timeout=15, verify=False)
     except requests.RequestException:
         return None
 
@@ -258,8 +260,8 @@ def main():
             consecutive_misses += 1
             print(f"  [{org_id:4d}] –  (no data)")
             # If 100 IDs in a row return nothing, we're past the end
-            if consecutive_misses >= 100:
-                print(f"\nNo data found for 100 consecutive IDs. Stopping early.")
+            if consecutive_misses >= 2000:
+                print(f"\nNo data found for 2000 consecutive IDs. Stopping early.")
                 break
 
         time.sleep(REQUEST_DELAY)
